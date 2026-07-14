@@ -1,6 +1,10 @@
 import { Editor, Plugin, EditorPosition } from 'obsidian';
 
 type Range = { anchor: EditorPosition; head: EditorPosition };
+type SelectionSet = Range[];
+type EditorState = { stack: SelectionSet[]; lastSet: SelectionSet | null };
+type Heading = { line: number; level: number };
+type Fence = { character: '`' | '~'; length: number };
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────
 
@@ -32,7 +36,7 @@ function strictlyContains(candidate: Range, from: EditorPosition, to: EditorPosi
 }
 
 function headingLevel(line: string): number {
-  const m = line.match(/^(#{1,6}) /);
+  const m = line.match(/^ {0,3}(#{1,6})(?:[ \t]+|$)/);
   return m ? m[1].length : 0;
 }
 
@@ -77,9 +81,11 @@ function findSentenceBoundaries(text: string): number[] {
         // uppercase letter, or end of text, or a markdown structural character.
         const next = k < text.length ? text[k] : '';
         if (next === '' || /[A-Z]/.test(next) || /[-*#\[>!]/.test(next)) {
-          // Heuristic: ignore single-letter abbreviations like "U.S.A." or "Dr."
+          // Heuristic: ignore common titles and single-letter abbreviations.
           const wordBefore = text.slice(0, i).match(/\S+$/)?.[0] ?? '';
-          if (ch === '.' && wordBefore.length <= 2 && /^[A-Za-z]$/.test(wordBefore)) {
+          const abbreviation = wordBefore.replace(/\.+$/, '').toLowerCase();
+          if (ch === '.' && (/^[a-z]$/.test(abbreviation) ||
+              /^(dr|mr|mrs|ms|prof|sr|jr)$/.test(abbreviation))) {
             i++;
             continue;
           }
@@ -129,8 +135,9 @@ function findSentence(
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
 export default class Expandomatic extends Plugin {
-  private selStack: Range[] = [];
-  private lastSet: Range | null = null;
+  // History belongs to an editor, not the plugin process. This prevents a
+  // Shrink command in one pane from replaying ranges saved in another pane.
+  private editorStates = new WeakMap<Editor, EditorState>();
 
   async onload() {
     this.addCommand({
@@ -152,31 +159,54 @@ export default class Expandomatic extends Plugin {
       posEq(posMax(a.anchor, a.head), posMax(b.anchor, b.head));
   }
 
-  private expand(editor: Editor) {
-    const sels = editor.listSelections();
-    if (!sels.length) return;
+  private selectionSetEq(a: SelectionSet, b: SelectionSet): boolean {
+    return a.length === b.length && a.every((range, index) => this.rangeEq(range, b[index]));
+  }
 
-    const sel = sels[0];
-    const cur: Range = { anchor: sel.anchor, head: sel.head };
+  private stateFor(editor: Editor): EditorState {
+    let state = this.editorStates.get(editor);
+    if (!state) {
+      state = { stack: [], lastSet: null };
+      this.editorStates.set(editor, state);
+    }
+    return state;
+  }
+
+  private currentSelections(editor: Editor): SelectionSet {
+    return editor.listSelections().map((selection) => ({
+      anchor: selection.anchor,
+      head: selection.head,
+    }));
+  }
+
+  private expand(editor: Editor) {
+    const current = this.currentSelections(editor);
+    if (!current.length) return;
+    const state = this.stateFor(editor);
 
     // Reset stack if the user moved the cursor or changed the selection manually.
-    if (this.lastSet !== null && !this.rangeEq(cur, this.lastSet)) {
-      this.selStack = [];
-      this.lastSet = null;
+    if (state.lastSet !== null && !this.selectionSetEq(current, state.lastSet)) {
+      state.stack = [];
+      state.lastSet = null;
     }
 
-    const from = posMin(cur.anchor, cur.head);
-    const to = posMax(cur.anchor, cur.head);
+    const expanded = current.map((selection) => this.expandOne(editor, selection));
+    if (!this.selectionSetEq(current, expanded)) {
+      state.stack.push(current);
+      editor.setSelections(expanded);
+      // CodeMirror may merge identical or overlapping selections. Track the
+      // normalized selection set so Shrink can still recognize its history.
+      state.lastSet = this.currentSelections(editor);
+    }
+  }
+
+  private expandOne(editor: Editor, current: Range): Range {
+    const from = posMin(current.anchor, current.head);
+    const to = posMax(current.anchor, current.head);
 
     // No selection → select nearest word, or nearest section if no word nearby.
     if (posEq(from, to)) {
-      const target = this.nearestWord(editor, from) ?? this.nearestSection(editor, from);
-      if (target) {
-        this.selStack.push(cur);
-        editor.setSelection(target.anchor, target.head);
-        this.lastSet = target;
-      }
-      return;
+      return this.nearestWord(editor, from) ?? this.nearestSection(editor, from) ?? current;
     }
 
     const ctx = this.context(editor, from, to);
@@ -184,38 +214,34 @@ export default class Expandomatic extends Plugin {
 
     for (const candidate of candidates) {
       if (candidate != null && strictlyContains(candidate, from, to)) {
-        this.selStack.push(cur);
-        editor.setSelection(candidate.anchor, candidate.head);
-        this.lastSet = { anchor: candidate.anchor, head: candidate.head };
-        return;
+        return candidate;
       }
     }
+    return current;
   }
 
   private shrink(editor: Editor) {
-    const sels = editor.listSelections();
-    if (!sels.length) return;
-
-    const sel = sels[0];
-    const cur: Range = { anchor: sel.anchor, head: sel.head };
+    const current = this.currentSelections(editor);
+    if (!current.length) return;
+    const state = this.stateFor(editor);
 
     // Only shrink if the selection is exactly what we last set and there's history.
-    if (this.lastSet === null || !this.rangeEq(cur, this.lastSet) || this.selStack.length === 0) {
-      this.selStack = [];
-      this.lastSet = null;
+    if (state.lastSet === null || !this.selectionSetEq(current, state.lastSet) || state.stack.length === 0) {
+      state.stack = [];
+      state.lastSet = null;
       return;
     }
 
-    const prev = this.selStack.pop()!;
-    editor.setSelection(prev.anchor, prev.head);
-    this.lastSet = prev;
+    const previous = state.stack.pop()!;
+    editor.setSelections(previous);
+    state.lastSet = this.currentSelections(editor);
   }
 
   // ── Context detection ───────────────────────────────────────────────────
 
   private context(editor: Editor, from: EditorPosition, to: EditorPosition): string {
     const line = editor.getLine(from.line);
-    if (/^\s*\|/.test(line)) return 'table';
+    if (this.tableBounds(editor, from.line)) return 'table';
     if (this.inFencedCode(editor, from)) return 'code';
     if (this.inEquation(editor, from)) return 'equation';
     // from may be sitting on the opening $ delimiter; check one char inside.
@@ -228,11 +254,50 @@ export default class Expandomatic extends Plugin {
   }
 
   private inFencedCode(editor: Editor, pos: EditorPosition): boolean {
-    let open = false;
+    let open: Fence | null = null;
     for (let i = 0; i < pos.line; i++) {
-      if (/^(`{3,}|~{3,})/.test(editor.getLine(i))) open = !open;
+      const fence = this.fenceAt(editor.getLine(i));
+      if (!fence) continue;
+      if (!open) open = fence;
+      else if (fence.character === open.character && fence.length >= open.length) open = null;
     }
-    return open;
+    return open !== null;
+  }
+
+  private fenceAt(line: string): Fence | null {
+    const match = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (!match) return null;
+    return { character: match[1][0] as '`' | '~', length: match[1].length };
+  }
+
+  private fenceBounds(editor: Editor, line: number): { start: number; end: number } | null {
+    let start = line;
+    let opener: Fence | null = null;
+    while (start >= 0) {
+      const candidate = this.fenceAt(editor.getLine(start));
+      if (candidate) { opener = candidate; break; }
+      start--;
+    }
+    if (!opener) return null;
+
+    let end = start + 1;
+    while (end < editor.lineCount()) {
+      const candidate = this.fenceAt(editor.getLine(end));
+      if (candidate && candidate.character === opener.character && candidate.length >= opener.length) {
+        return { start, end };
+      }
+      end++;
+    }
+    return null;
+  }
+
+  private headings(): Heading[] {
+    const file = this.app.workspace.getActiveFile();
+    const cache = file ? this.app.metadataCache.getFileCache(file) : null;
+    return cache?.headings?.map((heading) => ({
+      line: heading.position.start.line,
+      level: heading.level,
+    })) ?? [];
   }
 
   private inBlockEquation(editor: Editor, pos: EditorPosition): boolean {
@@ -348,11 +413,7 @@ export default class Expandomatic extends Plugin {
 
   private nearestSection(editor: Editor, pos: EditorPosition): Range | null {
     const lineCount = editor.lineCount();
-    const headings: { line: number; level: number }[] = [];
-    for (let i = 0; i < lineCount; i++) {
-      const lv = headingLevel(editor.getLine(i));
-      if (lv > 0) headings.push({ line: i, level: lv });
-    }
+    const headings = this.headings();
     if (headings.length === 0) return null;
 
     // Pick the heading closest to pos.line; ties go to the earlier one.
@@ -416,12 +477,7 @@ export default class Expandomatic extends Plugin {
   // each call will naturally find the next larger section.
   private section(editor: Editor, from: EditorPosition, to: EditorPosition): Range | null {
     const lineCount = editor.lineCount();
-    // Collect headings in document order.
-    const headings: { line: number; level: number }[] = [];
-    for (let i = 0; i < lineCount; i++) {
-      const lv = headingLevel(editor.getLine(i));
-      if (lv > 0) headings.push({ line: i, level: lv });
-    }
+    const headings = this.headings();
     if (headings.length === 0) return null;
 
     let best: Range | null = null;
@@ -532,12 +588,29 @@ export default class Expandomatic extends Plugin {
     return rng(pos.line, 0, pos.line, editor.getLine(pos.line).length);
   }
 
-  private tableAll(editor: Editor, pos: EditorPosition): Range {
-    const lc = editor.lineCount();
-    let s = pos.line, e = pos.line;
-    while (s > 0 && /^\s*\|/.test(editor.getLine(s - 1))) s--;
-    while (e < lc - 1 && /^\s*\|/.test(editor.getLine(e + 1))) e++;
-    return rng(s, 0, e, editor.getLine(e).length);
+  private isTableRow(editor: Editor, line: number): boolean {
+    return editor.getLine(line).includes('|');
+  }
+
+  private isTableDivider(editor: Editor, line: number): boolean {
+    return /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(editor.getLine(line));
+  }
+
+  private tableBounds(editor: Editor, line: number): { start: number; end: number } | null {
+    if (!this.isTableRow(editor, line)) return null;
+    let start = line, end = line;
+    while (start > 0 && this.isTableRow(editor, start - 1)) start--;
+    while (end < editor.lineCount() - 1 && this.isTableRow(editor, end + 1)) end++;
+    for (let i = start; i <= end; i++) {
+      if (this.isTableDivider(editor, i)) return { start, end };
+    }
+    return null;
+  }
+
+  private tableAll(editor: Editor, pos: EditorPosition): Range | null {
+    const bounds = this.tableBounds(editor, pos.line);
+    if (!bounds) return null;
+    return rng(bounds.start, 0, bounds.end, editor.getLine(bounds.end).length);
   }
 
   // ── Code block ──────────────────────────────────────────────────────────
@@ -547,12 +620,8 @@ export default class Expandomatic extends Plugin {
   }
 
   private codeBlock(editor: Editor, pos: EditorPosition): Range | null {
-    const lc = editor.lineCount();
-    const fence = /^(`{3,}|~{3,})/;
-    let s = pos.line, e = pos.line;
-    while (s > 0 && !fence.test(editor.getLine(s))) s--;
-    while (e < lc - 1 && !fence.test(editor.getLine(e))) e++;
-    return rng(s, 0, e, editor.getLine(e).length);
+    const bounds = this.fenceBounds(editor, pos.line);
+    return bounds ? rng(bounds.start, 0, bounds.end, editor.getLine(bounds.end).length) : null;
   }
 
   // ── Equation ────────────────────────────────────────────────────────────
