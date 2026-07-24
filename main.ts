@@ -136,11 +136,13 @@ export default class Expandomatic extends Plugin {
     this.addCommand({
       id: 'expand-selection',
       name: 'Expand Selection',
+      icon: 'list-chevrons-up-down',
       editorCallback: (editor: Editor) => this.expand(editor),
     });
     this.addCommand({
       id: 'shrink-selection',
       name: 'Shrink Selection',
+      icon: 'list-chevrons-down-up',
       editorCallback: (editor: Editor) => this.shrink(editor),
     });
   }
